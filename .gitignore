@@ -1,0 +1,7 @@
+__pycache__/
+*.pfx
+*.p12
+*.pem
+signing.local.json
+/src/
+/dist/

@@ -1,0 +1,901 @@
+diff --git a/wgengine/magicsock/magicsock.go b/wgengine/magicsock/magicsock.go
+index c3463e305..f76f87331 100644
+--- a/wgengine/magicsock/magicsock.go
++++ b/wgengine/magicsock/magicsock.go
+@@ -194,6 +194,21 @@ type Conn struct {
+ 	pconn4 RebindingUDPConn
+ 	pconn6 RebindingUDPConn
+ 
++	// rebindMu serializes socket replacement with socket shutdown. Never
++	// acquire mu while holding it (Close takes mu before rebindMu).
++	rebindMu syncs.Mutex
++	// These fields are guarded by rebindMu. IPv4 failure starts recovery;
++	// IPv6 is retried only if it also failed, preserving a healthy socket.
++	bindRetryNeeded     bool
++	bindRetryIPv6Failed bool
++	// Paused only after an opened Bind is closed, not before its first Open.
++	bindRetryPaused bool
++	// Open cannot acquire Conn.mu while wireguard-go holds its own locks.
++	// Leave post-bind processing to the existing recovery worker instead.
++	bindRetryPostBind bool
++	bindRetryWake     chan struct{}
++	bindRetryDone     chan struct{}
++
+ 	receiveBatchPool sync.Pool
+ 
+ 	// closeDisco4 and closeDisco6 are io.Closers to shut down the raw
+@@ -698,6 +713,8 @@ func NewConn(opts Options) (*Conn, error) {
+ 
+ 	c.connCtx, c.connCtxCancel = context.WithCancel(context.Background())
+ 	c.donec = c.connCtx.Done()
++	c.bindRetryWake = make(chan struct{}, 1)
++	c.bindRetryDone = make(chan struct{})
+ 
+ 	// Don't log the same log messages possibly every few seconds in our
+ 	// portmapper.
+@@ -775,6 +792,9 @@ func NewConn(opts Options) (*Conn, error) {
+ 	}
+ 
+ 	c.logf("magicsock: disco key = %v", c.discoAtomic.Short())
++	// Start only after construction is complete: the initial bind can fail,
++	// but recovery must not access a partially initialized Conn.
++	go c.retryFailedBind()
+ 	return c, nil
+ }
+ 
+@@ -3528,6 +3548,23 @@ func (c *connBind) Open(ignoredPort uint16) ([]conn.ReceiveFunc, uint16, error)
+ 	if !c.closed {
+ 		return nil, 0, errors.New("magicsock: connBind already open")
+ 	}
++	c.rebindMu.Lock()
++	if c.closing.Load() {
++		c.rebindMu.Unlock()
++		return nil, 0, net.ErrClosed
++	}
++	if c.bindRetryPaused {
++		// WireGuard has waited for the old receive funcs before reopening.
++		// Restore sockets (or blocking placeholders) before returning new
++		// receive funcs, so they cannot exit on the old sockets' close errors.
++		c.bindRetryPaused = false
++		if err := c.rebindSocketsLocked(keepCurrentPort, false); err != nil {
++			c.logf("%v", err)
++		}
++		c.bindRetryPostBind = !c.bindRetryNeeded || !c.bindRetryIPv6Failed
++		c.wakeBindRetryLocked()
++	}
++	c.rebindMu.Unlock()
+ 	c.closed = false
+ 	fns := []conn.ReceiveFunc{c.receiveIPv4(), c.receiveIPv6(), c.receiveDERP}
+ 	if runtime.GOOS == "js" {
+@@ -3557,8 +3594,15 @@ func (c *connBind) Close() error {
+ 	}
+ 	c.closed = true
+ 	// Unblock all outstanding receives.
++	c.rebindMu.Lock()
++	// Serialize the state change with recovery as well as socket closure:
++	// otherwise a queued retry could reopen sockets after Close returns.
++	c.bindRetryPaused = true
++	c.bindRetryPostBind = false
++	c.wakeBindRetryLocked()
+ 	c.pconn4.Close()
+ 	c.pconn6.Close()
++	c.rebindMu.Unlock()
+ 	if c.closeDisco4 != nil {
+ 		c.closeDisco4.Close()
+ 	}
+@@ -3594,7 +3638,14 @@ func (c *Conn) Close() error {
+ 	c.eventClient.Close()
+ 
+ 	c.mu.Lock()
+-	defer c.mu.Unlock()
++	defer func() {
++		c.mu.Unlock()
++		// Recovery's post-bind processing may need mu. Wait only after
++		// releasing it, so Close cannot deadlock with the recovery worker.
++		if c.bindRetryDone != nil {
++			<-c.bindRetryDone
++		}
++	}()
+ 	if c.closed {
+ 		return nil
+ 	}
+@@ -3616,8 +3667,10 @@ func (c *Conn) Close() error {
+ 	c.closeAllDerpLocked("conn-close")
+ 	// Ignore errors from c.pconnN.Close.
+ 	// They will frequently have been closed already by a call to connBind.Close.
++	c.rebindMu.Lock()
+ 	c.pconn6.Close()
+ 	c.pconn4.Close()
++	c.rebindMu.Unlock()
+ 	if c.closeDisco4 != nil {
+ 		c.closeDisco4.Close()
+ 	}
+@@ -3858,17 +3911,78 @@ func (c *Conn) bindSocket(ruc *RebindingUDPConn, network string, curPortFate cur
+ // rebind closes and re-binds the UDP sockets.
+ // We consider it successful if we manage to bind the IPv4 socket.
+ func (c *Conn) rebind(curPortFate currentPortFate) error {
+-	if err := c.bindSocket(&c.pconn6, "udp6", curPortFate); err != nil {
+-		c.logf("magicsock: Rebind ignoring IPv6 bind failure: %v", err)
++	_, err := c.rebindIfNeeded(curPortFate, false)
++	return err
++}
++
++// rebindIfNeeded also serves the recovery worker. Checking bindRetryNeeded
++// and replacing the sockets under the same lock prevents a stale retry from
++// closing sockets already repaired by an ordinary network-change rebind.
++func (c *Conn) rebindIfNeeded(curPortFate currentPortFate, failedOnly bool) (bool, error) {
++	c.rebindMu.Lock()
++	if c.closing.Load() || c.bindRetryPaused {
++		c.rebindMu.Unlock()
++		return false, net.ErrClosed
++	}
++	if failedOnly && (!c.bindRetryNeeded || c.onlyTCP443.Load()) {
++		c.rebindMu.Unlock()
++		return false, nil
++	}
++	ipv6Failed := c.bindRetryIPv6Failed
++	err := c.rebindSocketsLocked(curPortFate, failedOnly)
++	if err != nil && failedOnly && ipv6Failed && !c.bindRetryIPv6Failed {
++		// IPv6 became usable while IPv4 is still unavailable. Advertise that
++		// progress without disturbing it on subsequent IPv4 retry attempts.
++		c.bindRetryPostBind = true
++		c.wakeBindRetryLocked()
+ 	}
+-	if err := c.bindSocket(&c.pconn4, "udp4", curPortFate); err != nil {
++	c.rebindMu.Unlock()
++	if err != nil {
++		return true, err
++	}
++	if c.closing.Load() {
++		return true, net.ErrClosed
++	}
++	c.updateAfterBind()
++	return true, nil
++}
++
++// rebindSocketsLocked replaces sockets and records failures. Unlike the full
++// rebind follow-up it does not acquire Conn.mu, so connBind.Open may call it.
++// c.rebindMu must be held.
++func (c *Conn) rebindSocketsLocked(curPortFate currentPortFate, failedOnly bool) error {
++	if !failedOnly || c.bindRetryIPv6Failed {
++		err := c.bindSocket(&c.pconn6, "udp6", curPortFate)
++		c.bindRetryIPv6Failed = err != nil
++		if err != nil {
++			c.logf("magicsock: Rebind ignoring IPv6 bind failure: %v", err)
++		}
++	}
++	err := c.bindSocket(&c.pconn4, "udp4", curPortFate)
++	needed := err != nil
++	if c.bindRetryNeeded != needed {
++		c.bindRetryNeeded = needed
++		c.wakeBindRetryLocked()
++	}
++	if err != nil {
+ 		return fmt.Errorf("magicsock: Rebind IPv4 failed: %w", err)
+ 	}
++	return nil
++}
++
++// c.rebindMu must be held.
++func (c *Conn) wakeBindRetryLocked() {
++	select {
++	case c.bindRetryWake <- struct{}{}:
++	default:
++	}
++}
++
++func (c *Conn) updateAfterBind() {
+ 	if c.portMapper != nil {
+ 		c.portMapper.SetLocalPort(c.LocalPort())
+ 	}
+ 	c.UpdatePMTUD()
+-	return nil
+ }
+ 
+ // Rebind closes and re-binds the UDP sockets and resets the DERP connection.
+@@ -3879,13 +3993,18 @@ func (c *Conn) Rebind() {
+ 		c.logf("%v", err)
+ 		return
+ 	}
++	c.afterRebind()
++}
+ 
++// afterRebind preserves the ordinary successful-rebind path for recovery.
++func (c *Conn) afterRebind() {
+ 	var ifIPs []netip.Prefix
+ 	if c.netMon != nil {
+-		st := c.netMon.InterfaceState()
+-		defIf := st.DefaultRouteInterface
+-		ifIPs = st.InterfaceIPs[defIf]
+-		c.logf("Rebind; defIf=%q, ips=%v", defIf, ifIPs)
++		if st := c.netMon.InterfaceState(); st != nil {
++			defIf := st.DefaultRouteInterface
++			ifIPs = st.InterfaceIPs[defIf]
++			c.logf("Rebind; defIf=%q, ips=%v", defIf, ifIPs)
++		}
+ 	}
+ 
+ 	if len(ifIPs) > 0 {
+diff --git a/wgengine/magicsock/rebind_retry.go b/wgengine/magicsock/rebind_retry.go
+new file mode 100644
+index 000000000..e9ca7e5ac
+--- /dev/null
++++ b/wgengine/magicsock/rebind_retry.go
+@@ -0,0 +1,77 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++package magicsock
++
++import "time"
++
++const (
++	bindRetryInitialDelay = time.Second
++	bindRetryMaxDelay     = 30 * time.Second
++)
++
++// retryFailedBind restores a real UDP socket after all IPv4 bind candidates
++// failed. A minor link change (or no subsequent event at all) is insufficient
++// to repair blockForeverConn, whose writes deliberately succeed without
++// sending anything. Do not use netcheck failure as a trigger: an otherwise
++// healthy socket can simply be behind a firewall that drops STUN.
++func (c *Conn) retryFailedBind() {
++	defer close(c.bindRetryDone)
++	delay := bindRetryInitialDelay
++	for {
++		c.rebindMu.Lock()
++		needed := c.bindRetryNeeded && !c.bindRetryPaused
++		postBind := c.bindRetryPostBind && !c.bindRetryPaused
++		c.bindRetryPostBind = false
++		c.rebindMu.Unlock()
++		if postBind && !c.closing.Load() {
++			c.updateAfterBind()
++			c.afterRebind()
++			c.ReSTUN("bind-updated")
++		}
++		if !needed {
++			delay = bindRetryInitialDelay
++			select {
++			case <-c.donec:
++				return
++			case <-c.bindRetryWake:
++				continue
++			}
++		}
++
++		timer := time.NewTimer(delay)
++		select {
++		case <-c.donec:
++			timer.Stop()
++			return
++		case <-c.bindRetryWake:
++			timer.Stop()
++			// A completed bind, a fresh failure, or a Close/Open transition
++			// starts a new recovery episode, even if wakeups were coalesced.
++			delay = bindRetryInitialDelay
++			continue
++		case <-timer.C:
++		}
++
++		attempted, err := c.rebindIfNeeded(keepCurrentPort, true)
++		if c.closing.Load() {
++			return
++		}
++		if !attempted {
++			// For example, TCP-only mode is active. Stay idle at the capped
++			// interval instead of binding sockets or spinning.
++			delay = min(delay*2, bindRetryMaxDelay)
++			continue
++		}
++		if err != nil {
++			delay = min(delay*2, bindRetryMaxDelay)
++			c.logf("magicsock: UDP bind recovery failed; retrying in %v: %v", delay, err)
++			continue
++		}
++
++		c.logf("magicsock: UDP bind recovered; restarting endpoint discovery")
++		c.afterRebind()
++		c.ReSTUN("bind-recovered")
++		delay = bindRetryInitialDelay
++	}
++}
+diff --git a/wgengine/magicsock/rebind_retry_lifecycle_test.go b/wgengine/magicsock/rebind_retry_lifecycle_test.go
+new file mode 100644
+index 000000000..b050d3fb6
+--- /dev/null
++++ b/wgengine/magicsock/rebind_retry_lifecycle_test.go
+@@ -0,0 +1,246 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++package magicsock
++
++import (
++	"errors"
++	"net"
++	"net/netip"
++	"testing"
++	"testing/synctest"
++	"time"
++
++	"github.com/sagernet/tailscale/feature/buildfeatures"
++	"github.com/sagernet/tailscale/types/nettype"
++	"github.com/sagernet/wireguard-go/conn"
++)
++
++func TestBindRetryIPv4FailurePreservesHealthyIPv6(t *testing.T) {
++	synctest.Test(t, func(t *testing.T) {
++		l := new(retryTestListener)
++		l.fail4.Store(true)
++		c := newRetryTestConn(t, l)
++		defer c.Close()
++		l.mu.Lock()
++		v6 := l.conns[0]
++		l.mu.Unlock()
++		synctest.Wait()
++		time.Sleep(2 * time.Minute)
++		synctest.Wait()
++		if v6.wasClosed.Load() {
++			t.Fatal("an IPv4-only recovery attempt closed the healthy IPv6 socket")
++		}
++	})
++}
++
++func TestBindRetryBindCloseStopsRecovery(t *testing.T) {
++	synctest.Test(t, func(t *testing.T) {
++		l := new(retryTestListener)
++		c := newRetryTestConn(t, l)
++		defer c.Close()
++		if _, _, err := c.bind.Open(0); err != nil {
++			t.Fatal(err)
++		}
++		l.fail4.Store(true)
++		c.Rebind()
++		synctest.Wait()
++		if err := c.bind.Close(); err != nil {
++			t.Fatal(err)
++		}
++		before := len(l.attempts())
++		// An ordinary rebind must also respect the closed Bind, otherwise
++		// endpoint discovery could bypass the recovery worker's pause.
++		if err := c.rebind(keepCurrentPort); !errors.Is(err, net.ErrClosed) {
++			t.Fatalf("rebind while Bind is closed: %v", err)
++		}
++		l.fail4.Store(false)
++		time.Sleep(2 * time.Minute)
++		synctest.Wait()
++		if after := len(l.attempts()); after != before {
++			t.Fatalf("closed connBind was rebound: IPv4 attempts increased from %d to %d", before, after)
++		}
++	})
++}
++
++// A receiver may be descheduled after Close wakes its underlying read but
++// before RebindingUDPConn compares the old and current socket pointers.
++type retryGatedPacketConn struct {
++	nettype.PacketConn
++	entered chan struct{}
++	release chan struct{}
++}
++
++func (p *retryGatedPacketConn) ReadFromUDPAddrPort(b []byte) (int, netip.AddrPort, error) {
++	close(p.entered)
++	n, ap, err := p.PacketConn.ReadFromUDPAddrPort(b)
++	<-p.release
++	return n, ap, err
++}
++
++func (p *retryGatedPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
++	n, ap, err := p.ReadFromUDPAddrPort(b)
++	return n, net.UDPAddrFromAddrPort(ap), err
++}
++
++func TestBindRetryBindCloseUnblocksReceive(t *testing.T) {
++	synctest.Test(t, func(t *testing.T) {
++		l := new(retryTestListener)
++		l.fail4.Store(true)
++		c := newRetryTestConn(t, l)
++		// Gate the actual failed IPv4 placeholder. Recovery would replace
++		// this socket if it were allowed to continue after Bind Close.
++		gate := &retryGatedPacketConn{
++			PacketConn: c.pconn4.currentConn(),
++			entered:    make(chan struct{}),
++			release:    make(chan struct{}),
++		}
++		c.pconn4.mu.Lock()
++		c.pconn4.setConnLocked(gate, "", c.bind.BatchSize(), c.controlKnobs)
++		c.pconn4.mu.Unlock()
++		fns, _, err := c.bind.Open(0)
++		if err != nil {
++			t.Fatal(err)
++		}
++		readDone := make(chan struct{})
++		receiveErr := make(chan error, 1)
++		go func() {
++			// Use the same ReceiveFunc supplied to wireguard-go, including
++			// magicsock's batch adapter and RebindingUDPConn switch-over.
++			_, err := fns[0]([][]byte{make([]byte, 128)}, make([]int, 1), make([]conn.Endpoint, 1))
++			receiveErr <- err
++			close(readDone)
++		}()
++		<-gate.entered
++		defer func() {
++			select {
++			case <-gate.release:
++			default:
++				close(gate.release)
++			}
++			c.Close()
++			<-readDone
++		}()
++		if err := c.bind.Close(); err != nil {
++			t.Fatal(err)
++		}
++		l.fail4.Store(false)
++		time.Sleep(1100 * time.Millisecond)
++		synctest.Wait()
++		close(gate.release)
++		synctest.Wait()
++		select {
++		case <-readDone:
++			if err := <-receiveErr; !errors.Is(err, net.ErrClosed) {
++				t.Errorf("closed receiver returned %v; want net.ErrClosed", err)
++			}
++		default:
++			t.Error("connBind.Close receiver followed a socket reopened by recovery and remained blocked")
++		}
++	})
++}
++
++func TestBindRetryBindReopenRestoresSockets(t *testing.T) {
++	for _, unavailable := range []bool{false, true} {
++		name := "healthy"
++		if unavailable {
++			name = "transient-bind-failure"
++		}
++		t.Run(name, func(t *testing.T) {
++			synctest.Test(t, func(t *testing.T) {
++				l := new(retryTestListener)
++				c := newRetryTestConn(t, l)
++				defer c.Close()
++				if _, _, err := c.bind.Open(0); err != nil {
++					t.Fatal(err)
++				}
++				if err := c.bind.Close(); err != nil {
++					t.Fatal(err)
++				}
++				l.fail4.Store(unavailable)
++				l.fail6.Store(unavailable)
++				// Open must not acquire Conn.mu: WireGuard can call it while
++				// holding locks later in the engine's lock order.
++				c.mu.Lock()
++				_, port, err := c.bind.Open(0)
++				c.mu.Unlock()
++				if err != nil {
++					t.Fatal(err)
++				}
++				if unavailable && port != 0 || !unavailable && port != 41641 {
++					t.Fatalf("reopened port = %d, unavailable = %v", port, unavailable)
++				}
++				synctest.Wait()
++				l.fail4.Store(false)
++				l.fail6.Store(false)
++				time.Sleep(1100 * time.Millisecond)
++				synctest.Wait()
++				if c.pconn4.Port() != 41641 || c.pconn6.Port() != 41641 {
++					t.Fatal("reopened Bind did not restore both UDP sockets")
++				}
++				before := len(l.attempts())
++				time.Sleep(time.Minute)
++				synctest.Wait()
++				if len(l.attempts()) != before {
++					t.Fatal("reopened healthy Bind kept retrying")
++				}
++			})
++		})
++	}
++}
++
++func TestBindRetryPartialIPv6Recovery(t *testing.T) {
++	synctest.Test(t, func(t *testing.T) {
++		l := new(retryTestListener)
++		l.fail4.Store(true)
++		l.fail6.Store(true)
++		c := newRetryTestConn(t, l)
++		defer c.Close()
++		synctest.Wait()
++		before := metricReSTUNCalls.Value()
++		l.fail6.Store(false)
++		time.Sleep(1100 * time.Millisecond)
++		synctest.Wait()
++		if c.pconn6.Port() != 41641 || c.pconn4.Port() != 0 {
++			t.Fatal("IPv6 did not recover independently of IPv4")
++		}
++		if buildfeatures.HasClientMetrics && metricReSTUNCalls.Value() <= before {
++			t.Fatal("partial recovery did not request endpoint discovery")
++		}
++		v6 := c.pconn6.currentConn()
++		time.Sleep(2 * time.Minute)
++		synctest.Wait()
++		if c.pconn6.currentConn() != v6 {
++			t.Fatal("continued IPv4 failures replaced the recovered IPv6 socket")
++		}
++		l.fail4.Store(false)
++		time.Sleep(31 * time.Second)
++		synctest.Wait()
++		if c.pconn4.Port() != 41641 || c.pconn6.currentConn() != v6 {
++			t.Fatal("IPv4 did not recover while preserving IPv6")
++		}
++	})
++}
++
++func TestBindRetryNewFailureResetsBackoff(t *testing.T) {
++	synctest.Test(t, func(t *testing.T) {
++		l := new(retryTestListener)
++		l.fail4.Store(true)
++		c := newRetryTestConn(t, l)
++		defer c.Close()
++		time.Sleep(32 * time.Second)
++		synctest.Wait()
++		// Coalesce the success and new failure before the worker observes
++		// either. The new episode must not inherit the old 30-second delay.
++		l.fail4.Store(false)
++		c.Rebind()
++		l.fail4.Store(true)
++		c.Rebind()
++		l.fail4.Store(false)
++		time.Sleep(1100 * time.Millisecond)
++		synctest.Wait()
++		if c.LocalPort() != 41641 {
++			t.Fatal("new bind failure retained the previous episode's backoff")
++		}
++	})
++}
+diff --git a/wgengine/magicsock/rebind_retry_test.go b/wgengine/magicsock/rebind_retry_test.go
+new file mode 100644
+index 000000000..6d13589c9
+--- /dev/null
++++ b/wgengine/magicsock/rebind_retry_test.go
+@@ -0,0 +1,342 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++package magicsock
++
++import (
++	"context"
++	"errors"
++	"net"
++	"net/netip"
++	"runtime"
++	"slices"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"testing/synctest"
++	"time"
++
++	"github.com/sagernet/tailscale/net/netmon"
++	"github.com/sagernet/tailscale/types/nettype"
++	"github.com/sagernet/tailscale/util/eventbus"
++	"github.com/sagernet/tailscale/util/usermetric"
++)
++
++// This listener models the sing-box hook returning ErrNoRoute until its
++// default-interface monitor has caught up. No actual network is used.
++type retryTestListener struct {
++	fail4  atomic.Bool
++	fail6  atomic.Bool
++	mu     sync.Mutex
++	times  []time.Time
++	conns  []*retryTestPacketConn
++	block4 <-chan struct{}
++}
++
++func (l *retryTestListener) ListenPacket(_ context.Context, network, address string) (net.PacketConn, error) {
++	l.mu.Lock()
++	if network == "udp4" {
++		l.times = append(l.times, time.Now())
++	}
++	block := l.block4
++	l.mu.Unlock()
++	if network == "udp4" && block != nil {
++		<-block
++	}
++	if network == "udp4" && l.fail4.Load() || network == "udp6" && l.fail6.Load() {
++		return nil, errors.New("no route to internet")
++	}
++	ip := net.IPv4(127, 0, 0, 1)
++	if network == "udp6" {
++		ip = net.IPv6loopback
++	}
++	p := &retryTestPacketConn{
++		blockForeverConn: newBlockForeverConn(),
++		addr:             &net.UDPAddr{IP: ip, Port: 41641},
++	}
++	l.mu.Lock()
++	l.conns = append(l.conns, p)
++	l.mu.Unlock()
++	return p, nil
++}
++
++func (l *retryTestListener) attempts() []time.Time {
++	l.mu.Lock()
++	defer l.mu.Unlock()
++	return slices.Clone(l.times)
++}
++
++type retryTestPacketConn struct {
++	*blockForeverConn
++	addr      *net.UDPAddr
++	wasClosed atomic.Bool
++}
++
++func (p *retryTestPacketConn) LocalAddr() net.Addr { return p.addr }
++func (p *retryTestPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
++	n, a, err := p.ReadFromUDPAddrPort(b)
++	return n, net.UDPAddrFromAddrPort(a), err
++}
++func (p *retryTestPacketConn) WriteTo(b []byte, a net.Addr) (int, error) {
++	return p.WriteToUDPAddrPort(b, a.(*net.UDPAddr).AddrPort())
++}
++func (p *retryTestPacketConn) Close() error {
++	p.wasClosed.Store(true)
++	return p.blockForeverConn.Close()
++}
++
++func newRetryTestConn(t *testing.T, l nettype.PacketListener) *Conn {
++	t.Helper()
++	bus := eventbus.New()
++	t.Cleanup(bus.Close)
++	c, err := NewConn(Options{
++		Logf:                   t.Logf,
++		EventBus:               bus,
++		NetMon:                 netmon.NewStatic(),
++		Metrics:                new(usermetric.Registry),
++		Port:                   41641,
++		DisablePortMapper:      true,
++		TestOnlyPacketListener: l,
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	// Keep ReSTUN on its stopped-client path: tests exercise socket recovery,
++	// not external STUN servers or peers.
++	c.mu.Lock()
++	c.everHadKey = true
++	c.mu.Unlock()
++	return c
++}
++
++type retryRealListener struct{ unavailable atomic.Bool }
++
++func (l *retryRealListener) ListenPacket(_ context.Context, network, _ string) (net.PacketConn, error) {
++	if network != "udp4" || l.unavailable.Load() {
++		return nil, errors.New("no route to internet")
++	}
++	return net.ListenPacket("udp4", "127.0.0.1:0")
++}
++
++func TestBindRetryRestoresRealUDP(t *testing.T) {
++	l := new(retryRealListener)
++	l.unavailable.Store(true)
++	c := newRetryTestConn(t, l)
++	defer c.Close()
++	l.unavailable.Store(false)
++	deadline := time.Now().Add(5 * time.Second)
++	for c.LocalPort() == 0 && time.Now().Before(deadline) {
++		time.Sleep(10 * time.Millisecond)
++	}
++	if c.LocalPort() == 0 {
++		t.Fatal("real UDP listener did not recover")
++	}
++	receiver, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer receiver.Close()
++	if err := receiver.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := c.pconn4.WriteToUDPAddrPort([]byte("recovered"), receiver.LocalAddr().(*net.UDPAddr).AddrPort()); err != nil {
++		t.Fatal(err)
++	}
++	b := make([]byte, 32)
++	n, _, err := receiver.ReadFromUDP(b)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if string(b[:n]) != "recovered" {
++		t.Fatalf("received %q", b[:n])
++	}
++}
++
++func TestBindRetryRecoversWithoutNetworkEvent(t *testing.T) {
++	synctest.Test(t, func(t *testing.T) {
++		l := new(retryTestListener)
++		l.fail4.Store(true)
++		c := newRetryTestConn(t, l)
++		defer c.Close()
++		synctest.Wait()
++		if c.LocalPort() != 0 {
++			t.Fatal("failed bind must leave the dummy connection")
++		}
++		// First retry also fails; then the interface becomes usable without
++		// any major/minor notification whatsoever.
++		time.Sleep(1100 * time.Millisecond)
++		l.fail4.Store(false)
++		time.Sleep(2 * time.Second)
++		synctest.Wait()
++		if c.LocalPort() != 41641 {
++			t.Fatal("UDP socket was not restored")
++		}
++		before := len(l.attempts())
++		time.Sleep(2 * time.Minute)
++		synctest.Wait()
++		if len(l.attempts()) != before {
++			t.Fatal("successful recovery kept rebinding")
++		}
++	})
++}
++
++func TestBindRetryAfterRunningRebindFailure(t *testing.T) {
++	synctest.Test(t, func(t *testing.T) {
++		l := new(retryTestListener)
++		c := newRetryTestConn(t, l)
++		defer c.Close()
++		l.fail4.Store(true)
++		c.Rebind()
++		if c.LocalPort() != 0 {
++			t.Fatal("expected failed runtime rebind")
++		}
++		// Match the incident: a minor event only runs ReSTUN and the default
++		// interface becomes available just after the unsuccessful rebind.
++		c.ReSTUN("link-change-minor")
++		l.fail4.Store(false)
++		time.Sleep(1100 * time.Millisecond)
++		synctest.Wait()
++		if c.LocalPort() != 41641 {
++			t.Fatal("minor-only recovery did not rebind")
++		}
++	})
++}
++
++func TestBindRetryBackoffIsCapped(t *testing.T) {
++	synctest.Test(t, func(t *testing.T) {
++		l := new(retryTestListener)
++		l.fail4.Store(true)
++		c := newRetryTestConn(t, l)
++		defer c.Close()
++		start := time.Now()
++		time.Sleep(95 * time.Second)
++		synctest.Wait()
++		var offsets []time.Duration
++		for _, at := range l.attempts() {
++			d := at.Sub(start)
++			if len(offsets) == 0 || offsets[len(offsets)-1] != d {
++				offsets = append(offsets, d)
++			}
++		}
++		want := []time.Duration{0, time.Second, 3 * time.Second, 7 * time.Second, 15 * time.Second, 31 * time.Second, 61 * time.Second, 91 * time.Second}
++		if !slices.Equal(offsets, want) {
++			t.Fatalf("attempt offsets = %v; want %v", offsets, want)
++		}
++	})
++}
++
++func TestBindRetryNormalRebindCancelsPendingRetry(t *testing.T) {
++	synctest.Test(t, func(t *testing.T) {
++		l := new(retryTestListener)
++		l.fail4.Store(true)
++		c := newRetryTestConn(t, l)
++		defer c.Close()
++		synctest.Wait()
++		l.fail4.Store(false)
++		c.Rebind()
++		synctest.Wait()
++		before := len(l.attempts())
++		time.Sleep(time.Minute)
++		synctest.Wait()
++		if len(l.attempts()) != before {
++			t.Fatal("stale retry closed a healthy socket")
++		}
++	})
++}
++
++func TestBindRetryCloseStopsRecovery(t *testing.T) {
++	synctest.Test(t, func(t *testing.T) {
++		l := new(retryTestListener)
++		l.fail4.Store(true)
++		c := newRetryTestConn(t, l)
++		synctest.Wait()
++		if err := c.Close(); err != nil {
++			t.Fatal(err)
++		}
++		before := len(l.attempts())
++		l.fail4.Store(false)
++		time.Sleep(2 * time.Minute)
++		synctest.Wait()
++		if len(l.attempts()) != before {
++			t.Fatal("recovery recreated a socket after Close")
++		}
++		if err := c.rebind(keepCurrentPort); !errors.Is(err, net.ErrClosed) {
++			t.Fatalf("rebind after close: %v", err)
++		}
++	})
++}
++
++func TestBindRetryIPv6FailureDoesNotRebindHealthyIPv4(t *testing.T) {
++	synctest.Test(t, func(t *testing.T) {
++		l := new(retryTestListener)
++		l.fail6.Store(true)
++		c := newRetryTestConn(t, l)
++		defer c.Close()
++		before := len(l.attempts())
++		time.Sleep(2 * time.Minute)
++		synctest.Wait()
++		if c.LocalPort() != 41641 || len(l.attempts()) != before {
++			t.Fatal("IPv6 failure disturbed healthy IPv4")
++		}
++	})
++}
++
++func TestBindRetryHonorsTCPOnlyMode(t *testing.T) {
++	synctest.Test(t, func(t *testing.T) {
++		l := new(retryTestListener)
++		l.fail4.Store(true)
++		c := newRetryTestConn(t, l)
++		defer c.Close()
++		c.onlyTCP443.Store(true)
++		before := len(l.attempts())
++		time.Sleep(time.Minute)
++		synctest.Wait()
++		if len(l.attempts()) != before {
++			t.Fatal("recovery bound UDP in TCP-only mode")
++		}
++		l.fail4.Store(false)
++		c.onlyTCP443.Store(false)
++		time.Sleep(31 * time.Second)
++		synctest.Wait()
++		if c.LocalPort() != 41641 {
++			t.Fatal("recovery did not resume after TCP-only mode ended")
++		}
++	})
++}
++
++func TestBindRetryCloseDuringBind(t *testing.T) {
++	synctest.Test(t, func(t *testing.T) {
++		l := new(retryTestListener)
++		l.fail4.Store(true)
++		c := newRetryTestConn(t, l)
++		synctest.Wait()
++		release := make(chan struct{})
++		l.mu.Lock()
++		l.block4 = release
++		l.mu.Unlock()
++		l.fail4.Store(false)
++		time.Sleep(1100 * time.Millisecond)
++		synctest.Wait()
++		closed := make(chan struct{})
++		go func() { c.Close(); close(closed) }()
++		// Mutex waits are not considered durably blocked by synctest.
++		// Wait for Close's atomic marker, then release the held bind.
++		for !c.closing.Load() {
++			runtime.Gosched()
++		}
++		close(release)
++		<-closed
++		l.mu.Lock()
++		defer l.mu.Unlock()
++		for _, p := range l.conns {
++			if !p.wasClosed.Load() {
++				t.Fatal("socket leaked while closing during recovery")
++			}
++		}
++	})
++}
++
++// Keep the PacketConn's netip method set explicit for the listener adapter.
++var _ interface {
++	WriteToUDPAddrPort([]byte, netip.AddrPort) (int, error)
++} = (*retryTestPacketConn)(nil)
