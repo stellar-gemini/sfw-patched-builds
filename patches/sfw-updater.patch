@@ -1,0 +1,146 @@
+--- a/src/main/updates.ts
++++ b/src/main/updates.ts
+@@ -23,18 +23,28 @@
+ import { desktopService } from "./daemon";
+ import { userAgent } from "./userAgent";
+ 
+-const RELEASES_URL = "https://api.github.com/repos/SagerNet/sing-box/releases";
++const UPDATE_REPOSITORY = "stellar-gemini/sfw-patched-builds";
++const RELEASES_URL = `https://api.github.com/repos/${UPDATE_REPOSITORY}/releases`;
++const RELEASE_WEB_URL = `https://github.com/${UPDATE_REPOSITORY}/releases`;
++const UPDATE_TAG = /^sfw-v(\d+\.\d+\.\d+(?:-(?:alpha|beta|rc)\.\d+)?)-pr12-[a-f0-9]{12}-[a-f0-9]{8}-auto1$/u;
++
++function installerName(version: string): string {
++  return `SFW-${version}-x64-pr12.exe`;
++}
++
++function allowsInstallerURL(url: string, version: string): boolean {
++  const prefix = `${RELEASE_WEB_URL}/download/`;
++  if (!url.startsWith(prefix)) {
++    return false;
++  }
++  const [tag, file, extra] = url.slice(prefix.length).split("/");
++  return extra === undefined && UPDATE_TAG.exec(tag)?.[1] === version && file === installerName(version);
++}
+ const RELEASES_REQUEST_TIMEOUT_MILLISECONDS = 30_000;
+ const EXIT_CODE_CANCELLED = 1223;
+ const EXIT_CODE_LAUNCH_FAILED = 1224;
+ 
+-const WINDOWS_UPDATE_ARCHITECTURES: Partial<Record<NodeJS.Architecture, string[]>> = {
+-  arm64: ["arm64", "x64", "x86"],
+-  ia32: ["x86"],
+-  x64: ["x64"],
+-};
+-const updateArchitectureTokens = WINDOWS_UPDATE_ARCHITECTURES[process.arch];
+-const UPDATES_SUPPORTED = process.platform === "win32" && updateArchitectureTokens !== undefined;
++const UPDATES_SUPPORTED = process.platform === "win32" && process.arch === "x64";
+ const APP_IS_PRERELEASE = prerelease(__APP_VERSION__) !== null;
+ 
+ function parseString(value: unknown): string {
+@@ -169,6 +179,7 @@
+   if (
+     info === null ||
+     (track === "stable" && info.isPrerelease) ||
++    !allowsInstallerURL(info.downloadURL, info.versionName) ||
+     !shouldIncludeVersion(info.versionName, track)
+   ) {
+     setUpdateInfo(null);
+@@ -193,7 +204,7 @@
+   assets: GitHubAsset[];
+ }
+ 
+-async function fetchReleases(track: UpdateTrack, githubToken: string): Promise<GitHubRelease[]> {
++async function fetchReleases(githubToken: string): Promise<GitHubRelease[]> {
+   const headers = new Headers({
+     "Accept": "application/vnd.github+json",
+     "User-Agent": userAgent(),
+@@ -203,7 +214,7 @@
+     headers.set("Authorization", `Bearer ${token}`);
+   }
+   const response = await fetch(
+-    track === "stable" ? `${RELEASES_URL}/latest` : `${RELEASES_URL}?per_page=3`,
++    `${RELEASES_URL}?per_page=30`,
+     {
+       headers,
+       signal: AbortSignal.timeout(RELEASES_REQUEST_TIMEOUT_MILLISECONDS),
+@@ -212,26 +223,13 @@
+   if (!response.ok) {
+     throw new Error(`fetch releases: HTTP ${response.status}`);
+   }
+-  if (track === "stable") {
+-    return [(await response.json()) as GitHubRelease];
+-  }
+   return (await response.json()) as GitHubRelease[];
+ }
+ 
+-function findWindowsAsset(assets: GitHubAsset[]): GitHubAsset | null {
+-  if (updateArchitectureTokens === undefined) {
+-    throw new Error(`unsupported Windows architecture: ${process.arch}`);
+-  }
+-  const executables = assets.filter(
+-    (asset) => asset.name.startsWith("SFW-") && asset.name.endsWith(".exe"),
+-  );
+-  for (const token of updateArchitectureTokens) {
+-    const match = executables.find((asset) => asset.name.endsWith(`-${token}.exe`));
+-    if (match !== undefined) {
+-      return match;
+-    }
+-  }
+-  return null;
++function findWindowsAsset(assets: GitHubAsset[], version: string): GitHubAsset | null {
++  return assets.find((asset) =>
++    asset.name === installerName(version) && allowsInstallerURL(asset.browser_download_url, version)
++  ) ?? null;
+ }
+ 
+ async function checkForUpdate(): Promise<AppUpdateInfo | null> {
+@@ -245,7 +243,7 @@
+   broadcastState();
+   try {
+     const track = currentTrack();
+-    const releases = await fetchReleases(track, githubTokenPreference.get());
++    const releases = await fetchReleases(githubTokenPreference.get());
+     if (currentTrack() !== track) {
+       return runtime.info;
+     }
+@@ -254,16 +252,17 @@
+       if (release.draft) {
+         continue;
+       }
+-      const asset = findWindowsAsset(release.assets);
++      const version = UPDATE_TAG.exec(release.tag_name)?.[1];
++      if (version === undefined) {
++        continue;
++      }
++      const asset = findWindowsAsset(release.assets, version);
+       if (asset === null) {
+         continue;
+       }
+       if (track === "stable" && release.prerelease) {
+         continue;
+       }
+-      const version = release.tag_name.startsWith("v")
+-        ? release.tag_name.slice(1)
+-        : release.tag_name;
+       if (!shouldIncludeVersion(version, track)) {
+         continue;
+       }
+@@ -272,7 +271,7 @@
+       }
+       best = {
+         versionName: version,
+-        releaseURL: release.html_url,
++        releaseURL: `${RELEASE_WEB_URL}/tag/${release.tag_name}`,
+         downloadURL: asset.browser_download_url,
+         releaseNotes: release.body ?? "",
+         isPrerelease: release.prerelease,
+@@ -296,6 +295,9 @@
+ }
+ 
+ async function downloadUpdate(info: AppUpdateInfo): Promise<string> {
++  if (!allowsInstallerURL(info.downloadURL, info.versionName)) {
++    throw new Error("unsupported installer download source");
++  }
+   const directory = join(applicationCacheDirectory(), "updates");
+   await mkdir(directory, { recursive: true });
+   const fileName = basename(new URL(info.downloadURL).pathname);

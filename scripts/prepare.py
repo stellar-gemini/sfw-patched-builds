@@ -13,6 +13,7 @@ import subprocess
 MODULE = "github.com/sagernet/tailscale"
 PR_HEAD = "c409abe7abaee51b20795b9fdb56dffe94f41b46"
 ROOT = Path(__file__).resolve().parents[1]
+UPDATE_REPOSITORY = "stellar-gemini/sfw-patched-builds"
 
 
 def capture(*args, cwd):
@@ -64,14 +65,9 @@ def main():
         raise RuntimeError("Invalid desktop Go version")
     version_data["version"] = tag.removeprefix("v")
     version_file.write_text(json.dumps(version_data, indent=2) + "\n", encoding="utf-8")
-    # The stock updater would fetch stock installers and overwrite this build.
-    updater = desktop / "src" / "main" / "updates.ts"
-    text = updater.read_text(encoding="utf-8")
-    pattern = r'^const UPDATES_SUPPORTED = process\.platform === "win32" && updateArchitectureTokens !== undefined;$'
-    text, count = re.subn(pattern, "const UPDATES_SUPPORTED: boolean = false;", text, flags=re.MULTILINE)
-    if count != 1:
-        raise RuntimeError("Desktop updater changed. Review before packaging.")
-    updater.write_text(text, encoding="utf-8", newline="\n")
+    updater_patch = ROOT / "patches" / "sfw-updater.patch"
+    run("git", "apply", "--check", str(updater_patch), cwd=desktop)
+    run("git", "apply", str(updater_patch), cwd=desktop)
 
     output = ROOT / "dist"
     output.mkdir(exist_ok=True)
@@ -87,7 +83,8 @@ def main():
         "patch_sha256": hashlib.sha256(patch.read_bytes()).hexdigest(),
         "patch_status": patch_status,
         "go_version": version_data["go_version"],
-        "official_in_app_updates": False,
+        "in_app_update_repository": UPDATE_REPOSITORY,
+        "desktop_update_patch_sha256": hashlib.sha256(updater_patch.read_bytes()).hexdigest(),
         "architecture": "x64",
     }
     (output / "build-info.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")

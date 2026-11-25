@@ -55,7 +55,7 @@ def main():
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise RuntimeError("Could not resolve the upstream tag to a commit")
     patch_sha = hashlib.sha256(PATCH.read_bytes()).hexdigest()
-    release_tag = f"sfw-{tag}-pr12-{patch_sha[:12]}-{commit[:8]}"
+    release_tag = f"sfw-{tag}-pr12-{patch_sha[:12]}-{commit[:8]}-auto1"
     published_tags = gh(
         f"repos/{os.environ['GITHUB_REPOSITORY']}/releases?per_page=100",
         "--paginate", "--jq", '.[] | select(.draft == false) | .tag_name',

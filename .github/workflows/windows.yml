@@ -67,7 +67,7 @@ jobs:
             throw "The upstream tag moved after planning."
           }
           git -C src/sing-box tag -f $env:UPSTREAM_TAG HEAD
-          git -C src/sing-box submodule update --init --recursive --depth=1 -- clients/desktop
+          git -C src/sing-box -c core.autocrlf=false submodule update --init --recursive --depth=1 -- clients/desktop
           $version = Get-Content src/sing-box/clients/desktop/version.json -Raw | ConvertFrom-Json
           if ($version.go_version -cnotmatch '^go[0-9]+\.[0-9]+\.[0-9]+$') {
             throw 'Missing desktop Go toolchain version.'
@@ -178,7 +178,7 @@ jobs:
         with:
           name: sfw-windows-x64
           path: dist
-      - name: Publish verified installer to the private repository
+      - name: Publish verified installer
         shell: bash
         run: |
           set -euo pipefail
@@ -188,9 +188,9 @@ jobs:
           cat > notes.md <<EOF
           Personal build from [sing-box ${UPSTREAM_TAG}](https://github.com/SagerNet/sing-box/releases/tag/${UPSTREAM_TAG}) with [Tailscale PR #12](https://github.com/SagerNet/tailscale/pull/12).
 
-          The installer, GUI, and daemon use this repository's own signing certificate. Compare its thumbprint with the pinned value in the repository README before trusting the included public certificate. Download future builds from this Releases page.
+          The installer, GUI, and daemon use this repository's own signing certificate. Compare its thumbprint with the pinned value in the repository README before trusting the included public certificate. This version checks for updates from this Releases page.
 
-          See build-info.json for the exact source commits, Tailscale module checksum, and patch details.
+          See build-info.json for the exact source commits, Tailscale module checksum, and patch details. This release's tag points to the build scripts and patches. The repository README explains where to obtain the corresponding upstream source.
           EOF
           flags=()
           if [[ "$PRERELEASE" == true ]]; then flags+=(--prerelease); fi
