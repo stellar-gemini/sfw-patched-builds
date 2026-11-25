@@ -11,7 +11,11 @@ from urllib.request import Request, urlopen
 
 
 UPSTREAM = "SagerNet/sing-box"
-PATCH = Path("patches/tailscale-pr12.patch")
+PATCHES = (
+    Path("patches/tailscale-pr12.patch"),
+    Path("patches/sfw-updater.patch"),
+    Path("patches/sfw-sidebar-version.patch"),
+)
 TAG = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-(?:alpha|beta|rc)\.[0-9]+)?")
 
 
@@ -54,8 +58,8 @@ def main():
     commit = upstream(f"commits/{tag}")["sha"]
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise RuntimeError("Could not resolve the upstream tag to a commit")
-    patch_sha = hashlib.sha256(PATCH.read_bytes()).hexdigest()
-    release_tag = f"sfw-{tag}-pr12-{patch_sha[:12]}-{commit[:8]}-auto1"
+    patch_set = hashlib.sha256(b"".join(hashlib.sha256(patch.read_bytes()).digest() for patch in PATCHES))
+    release_tag = f"sfw-{tag}-pr12-{patch_set.hexdigest()[:12]}-{commit[:8]}-auto1"
     published_tags = gh(
         f"repos/{os.environ['GITHUB_REPOSITORY']}/releases?per_page=100",
         "--paginate", "--jq", '.[] | select(.draft == false) | .tag_name',

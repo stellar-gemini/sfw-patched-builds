@@ -184,9 +184,11 @@ jobs:
           set -euo pipefail
           cd dist
           sha256sum --check SHA256SUMS.txt
-          title="Unofficial SFW ${UPSTREAM_TAG#v} Windows x64 with PR #12"
+          title="Unofficial SFW ${UPSTREAM_TAG#v} for Windows x64 — Tailscale UDP Bind Recovery"
           cat > notes.md <<EOF
-          Personal build from [sing-box ${UPSTREAM_TAG}](https://github.com/SagerNet/sing-box/releases/tag/${UPSTREAM_TAG}) with [Tailscale PR #12](https://github.com/SagerNet/tailscale/pull/12).
+          Unofficial build of [sing-box ${UPSTREAM_TAG}](https://github.com/SagerNet/sing-box/releases/tag/${UPSTREAM_TAG}) with the [Tailscale UDP bind recovery patch (SagerNet/tailscale#12)](https://github.com/SagerNet/tailscale/pull/12). It retries failed UDP binds so Tailscale can rediscover direct paths after the network returns.
+
+          The desktop sidebar displays +ts-udp-rebind after the version. If you already run the same sing-box version, rerun this installer manually to get the sidebar label. The app checks for newer sing-box versions in this repository.
 
           The installer, GUI, and daemon use this repository's own signing certificate. Compare its thumbprint with the pinned value in the repository README before trusting the included public certificate. This version checks for updates from this Releases page.
 

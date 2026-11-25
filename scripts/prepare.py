@@ -39,6 +39,7 @@ def apply_patch(target, patch):
 def main():
     box = ROOT / "src" / "sing-box"
     desktop = box / "clients" / "desktop"
+    dashboard = desktop / "dashboard"
     tag = os.environ["UPSTREAM_TAG"]
     patch = ROOT / "patches" / "tailscale-pr12.patch"
     go_mod = json.loads(capture("go", "mod", "edit", "-json", cwd=box))
@@ -66,8 +67,11 @@ def main():
     version_data["version"] = tag.removeprefix("v")
     version_file.write_text(json.dumps(version_data, indent=2) + "\n", encoding="utf-8")
     updater_patch = ROOT / "patches" / "sfw-updater.patch"
+    sidebar_patch = ROOT / "patches" / "sfw-sidebar-version.patch"
     run("git", "apply", "--check", str(updater_patch), cwd=desktop)
+    run("git", "apply", "--check", str(sidebar_patch), cwd=dashboard)
     run("git", "apply", str(updater_patch), cwd=desktop)
+    run("git", "apply", str(sidebar_patch), cwd=dashboard)
 
     output = ROOT / "dist"
     output.mkdir(exist_ok=True)
@@ -75,7 +79,7 @@ def main():
         "sing_box_tag": tag,
         "sing_box_commit": capture("git", "rev-parse", "HEAD", cwd=box),
         "desktop_commit": capture("git", "rev-parse", "HEAD", cwd=desktop),
-        "dashboard_commit": capture("git", "rev-parse", "HEAD", cwd=desktop / "dashboard"),
+        "dashboard_commit": capture("git", "rev-parse", "HEAD", cwd=dashboard),
         "tailscale_version": version,
         "tailscale_sum": checksum,
         "patch_pr": "https://github.com/SagerNet/tailscale/pull/12",
@@ -85,6 +89,7 @@ def main():
         "go_version": version_data["go_version"],
         "in_app_update_repository": UPDATE_REPOSITORY,
         "desktop_update_patch_sha256": hashlib.sha256(updater_patch.read_bytes()).hexdigest(),
+        "sidebar_version_patch_sha256": hashlib.sha256(sidebar_patch.read_bytes()).hexdigest(),
         "architecture": "x64",
     }
     (output / "build-info.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")

@@ -2,6 +2,8 @@ $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
 $desktop = 'src/sing-box/clients/desktop'
 $bin = Join-Path $desktop 'release/win-unpacked'
+$asar = Join-Path $bin 'resources/app.asar'
+node -e 'if (!require("node:fs").readFileSync(process.argv[1]).includes(Buffer.from("+ts-udp-rebind"))) throw new Error("Missing sidebar version label");' $asar
 $installer = @(Get-ChildItem "$desktop/release/SFW-*-x64.exe" -File)
 if ($installer.Count -ne 1) {
     throw "Expected one x64 installer, found $($installer.Count)."

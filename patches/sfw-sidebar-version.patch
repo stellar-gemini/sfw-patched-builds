@@ -1,0 +1,11 @@
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -958,7 +958,7 @@
+             <div className={styles.sidebarTitlebar} />
+             <div className={styles.sidebarBrand}>
+               sing-box
+-              {serverInfo && <span className={styles.sidebarBrandVersion}>{serverInfo.version}</span>}
++              {serverInfo && <span className={styles.sidebarBrandVersion}>{serverInfo.version}+ts-udp-rebind</span>}
+             </div>
+             {started ? (
+               <>
