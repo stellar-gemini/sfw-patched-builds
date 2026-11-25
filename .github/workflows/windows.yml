@@ -109,7 +109,14 @@ jobs:
           rustup toolchain install 1.88.0 --profile minimal --target x86_64-pc-windows-msvc
           pnpm install --frozen-lockfile
           pnpm -C dashboard install --frozen-lockfile
+      - name: Trust the pinned public certificate on this runner
+        timeout-minutes: 2
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $cert = (Resolve-Path SFW-Patched-Code-Signing.cer).Path
+          certutil.exe -f -addstore Root $cert
       - name: Package and sign using the upstream desktop build
+        timeout-minutes: 30
         working-directory: src/sing-box/clients/desktop
         env:
           WINDOWS_SIGNING_PFX: ${{ secrets.WINDOWS_SIGNING_PFX }}
@@ -122,6 +129,7 @@ jobs:
           }
           $certificatePath = Join-Path $env:RUNNER_TEMP sfw-signing.pfx
           $publicCertificate = Join-Path $env:GITHUB_WORKSPACE dist/SFW-Patched-Code-Signing.cer
+          $pinnedCertificate = Join-Path $env:GITHUB_WORKSPACE SFW-Patched-Code-Signing.cer
           try {
             [IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($env:WINDOWS_SIGNING_PFX))
             $cert = [Security.Cryptography.X509Certificates.X509Certificate2]::new(
@@ -129,7 +137,9 @@ jobs:
               [Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet)
             [IO.File]::WriteAllBytes($publicCertificate, $cert.Export(
               [Security.Cryptography.X509Certificates.X509ContentType]::Cert))
-            Import-Certificate -FilePath $publicCertificate -CertStoreLocation Cert:\CurrentUser\Root | Out-Null
+            if ((Get-FileHash $publicCertificate).Hash -ne (Get-FileHash $pinnedCertificate).Hash) {
+              throw 'Signing secret does not match the pinned public certificate.'
+            }
             @{
               windows = @{
                 certificateFile = $certificatePath
