@@ -27,6 +27,7 @@ jobs:
       commit: ${{ steps.plan.outputs.commit }}
       release_tag: ${{ steps.plan.outputs.release_tag }}
       prerelease: ${{ steps.plan.outputs.prerelease }}
+      tailscale_version: ${{ steps.plan.outputs.tailscale_version }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -37,6 +38,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REQUESTED_TAG: ${{ inputs.tag }}
+      - name: Verify patch selection
+        run: python3 -m unittest discover -s scripts -p test_tailscale_patch.py
 
   build:
     if: needs.plan.outputs.build == 'true'
@@ -49,6 +52,7 @@ jobs:
     env:
       UPSTREAM_TAG: ${{ needs.plan.outputs.tag }}
       UPSTREAM_COMMIT: ${{ needs.plan.outputs.commit }}
+      EXPECTED_TAILSCALE_VERSION: ${{ needs.plan.outputs.tailscale_version }}
       GOWORK: 'off'
     steps:
       - uses: actions/checkout@v5
@@ -89,7 +93,10 @@ jobs:
           $passed = @(Get-Content $report | ForEach-Object { ConvertFrom-Json $_ } |
             Where-Object { $_.Action -eq 'pass' -and $_.Test -match '^TestBindRetry[^/]+$' } |
             Select-Object -ExpandProperty Test -Unique)
-          if ($passed.Count -lt 15) { throw "Expected at least 15 UDP recovery tests, got $($passed.Count)." }
+          $manifest = Get-Content ../../dist/build-info.json -Raw | ConvertFrom-Json
+          if ($passed.Count -lt $manifest.minimum_recovery_tests) {
+            throw "Expected at least $($manifest.minimum_recovery_tests) UDP recovery tests for $($manifest.patch_variant), got $($passed.Count)."
+          }
         env:
           GOTOOLCHAIN: local
       - uses: pnpm/action-setup@v4

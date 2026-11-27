@@ -12,6 +12,15 @@
 
 构建使用官方标签锁定的 GUI、dashboard 和 Go 依赖。流水线比对 `go.sum`，在该版本实际使用的 Tailscale 依赖上应用已固定的 PR 补丁，再运行 UDP 恢复回归测试。补丁冲突、测试失败、签名无效或 daemon 没有使用补丁后的依赖时，构建失败且不会发布。已有同版本、同官方提交、同补丁的成功产物时，定时任务跳过构建。
 
+构建按 `go.mod` 中实际的 Tailscale 依赖选择补丁。
+
+| Tailscale 依赖 | 补丁文件 | 最少回归测试 |
+| --- | --- | --- |
+| `v1.102.x-sing-box-…` | `patches/tailscale-pr12.patch` | 15 项 |
+| `v1.106.x-sing-box-…` | `patches/tailscale-pr12-ts106.patch` | 16 项，包含 socket group 生命周期 |
+
+106 补丁将同一恢复方案适配到新版的 socket group 和接收接口。两套补丁独立保存，构建使用的补丁、测试数和 SHA-256 写入 `build-info.json`。未知依赖版本会停止构建并提示适配。独立的兼容性工作流在 Linux 上同时验证两套补丁，开启 race 检测，每项测试重复三次。发布工作流在 Windows 上运行所选版本的回归测试。
+
 每个发行版包含安装包、证书公钥、`SHA256SUMS.txt` 及 `build-info.json`。清单记录上游源码提交、补丁校验值和构建记录。私钥存放在该仓库的 Actions Secrets。
 
 对应的源码和构建方式可从该发行标签获取。按 `build-info.json` 中记录的提交从 [sing-box](https://github.com/SagerNet/sing-box)、[桌面客户端](https://github.com/SagerNet/sing-box-for-desktop) 和 [dashboard](https://github.com/SagerNet/sing-box-dashboard) 获取源码，并按同一标签的 Actions 工作流下载 `go.sum` 锁定的依赖和应用 `patches/` 中的补丁。各组件保留上游许可证和版权声明。

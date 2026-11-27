@@ -1,0 +1,49 @@
+name: Tailscale patch compatibility
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'patches/**'
+      - 'scripts/**'
+      - '.github/workflows/patch-tests.yml'
+      - '.github/workflows/windows.yml'
+  pull_request:
+    paths:
+      - 'patches/**'
+      - 'scripts/**'
+      - '.github/workflows/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  recovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ['1.102', '1.106']
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.4'
+          cache: false
+      - name: Verify version selection
+        run: python3 -m unittest discover -s scripts -p test_tailscale_patch.py
+      - name: Validate patch and recovery behavior
+        run: python3 scripts/check_patch.py "${{ matrix.variant }}"
+        env:
+          GOTOOLCHAIN: local
+          GOWORK: 'off'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: recovery-tests-${{ matrix.variant }}
+          path: recovery-tests-*.jsonl
+          retention-days: 7

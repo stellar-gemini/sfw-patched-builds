@@ -5,3 +5,4 @@ __pycache__/
 signing.local.json
 /src/
 /dist/
+/recovery-tests-*.jsonl

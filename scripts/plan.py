@@ -1,21 +1,15 @@
 """Select a published sing-box release that ships the x64 desktop client."""
 
-import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import subprocess
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
+from tailscale_patch import build_fingerprint, dependency_version, select_variant
 
 UPSTREAM = "SagerNet/sing-box"
-PATCHES = (
-    Path("patches/tailscale-pr12.patch"),
-    Path("patches/sfw-updater.patch"),
-    Path("patches/sfw-sidebar-version.patch"),
-)
 TAG = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-(?:alpha|beta|rc)\.[0-9]+)?")
 
 
@@ -58,8 +52,14 @@ def main():
     commit = upstream(f"commits/{tag}")["sha"]
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise RuntimeError("Could not resolve the upstream tag to a commit")
-    patch_set = hashlib.sha256(b"".join(hashlib.sha256(patch.read_bytes()).digest() for patch in PATCHES))
-    release_tag = f"sfw-{tag}-pr12-{patch_set.hexdigest()[:12]}-{commit[:8]}-auto1"
+    request = Request(
+        f"https://raw.githubusercontent.com/{UPSTREAM}/{commit}/go.mod",
+        headers={"User-Agent": "SFW-patched-builds"},
+    )
+    with urlopen(request, timeout=30) as response:
+        tailscale_version = dependency_version(response.read().decode("utf-8"))
+    variant = select_variant(tailscale_version)
+    release_tag = f"sfw-{tag}-pr12-{build_fingerprint(variant)}-{commit[:8]}-auto1"
     published_tags = gh(
         f"repos/{os.environ['GITHUB_REPOSITORY']}/releases?per_page=100",
         "--paginate", "--jq", '.[] | select(.draft == false) | .tag_name',
@@ -70,6 +70,8 @@ def main():
         "commit": commit,
         "release_tag": release_tag,
         "prerelease": str(selected["prerelease"]).lower(),
+        "tailscale_version": tailscale_version,
+        "patch_variant": variant["name"],
     }
     print(json.dumps(outputs))
     with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as file:

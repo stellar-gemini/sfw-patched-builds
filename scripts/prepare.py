@@ -9,8 +9,8 @@ import shutil
 import stat
 import subprocess
 
+from tailscale_patch import MODULE, select_variant
 
-MODULE = "github.com/sagernet/tailscale"
 PR_HEAD = "c409abe7abaee51b20795b9fdb56dffe94f41b46"
 ROOT = Path(__file__).resolve().parents[1]
 UPDATE_REPOSITORY = "stellar-gemini/sfw-patched-builds"
@@ -41,11 +41,14 @@ def main():
     desktop = box / "clients" / "desktop"
     dashboard = desktop / "dashboard"
     tag = os.environ["UPSTREAM_TAG"]
-    patch = ROOT / "patches" / "tailscale-pr12.patch"
     go_mod = json.loads(capture("go", "mod", "edit", "-json", cwd=box))
     if any(entry["Old"]["Path"] == MODULE for entry in go_mod.get("Replace") or []):
         raise RuntimeError("Upstream added a Tailscale module replacement. Review the new build inputs.")
     version = next(entry["Version"] for entry in go_mod["Require"] if entry["Path"] == MODULE)
+    variant = select_variant(version)
+    if os.environ.get("EXPECTED_TAILSCALE_VERSION", version) != version:
+        raise RuntimeError("Tailscale dependency changed after planning.")
+    patch = ROOT / variant["file"]
     download = json.loads(capture("go", "mod", "download", "-json", f"{MODULE}@{version}", cwd=box))
     checksum = download["Sum"]
     sum_line = f"{MODULE} {version} {checksum}"
@@ -55,6 +58,7 @@ def main():
     if target.exists():
         raise RuntimeError(f"{target} already exists. Start with a fresh source checkout.")
     shutil.copytree(download["Dir"], target)
+    target.chmod(target.stat().st_mode | stat.S_IWUSR)
     for file in target.rglob("*"):
         file.chmod(file.stat().st_mode | stat.S_IWUSR)
     patch_status = apply_patch(target, patch)
@@ -82,8 +86,12 @@ def main():
         "dashboard_commit": capture("git", "rev-parse", "HEAD", cwd=dashboard),
         "tailscale_version": version,
         "tailscale_sum": checksum,
+        "patch_variant": variant["name"],
+        "patch_file": variant["file"],
+        "patch_base_version": variant["base"],
+        "minimum_recovery_tests": variant["minimum_tests"],
         "patch_pr": "https://github.com/SagerNet/tailscale/pull/12",
-        "patch_commit": PR_HEAD,
+        "patch_source_commit": PR_HEAD,
         "patch_sha256": hashlib.sha256(patch.read_bytes()).hexdigest(),
         "patch_status": patch_status,
         "go_version": version_data["go_version"],
