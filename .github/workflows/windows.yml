@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Published sing-box tag. Blank follows the latest stable SFW x64 release.'
+        description: 'Published sing-box tag. Blank follows both stable and preview SFW x64 releases.'
         type: string
         required: false
 
@@ -18,197 +18,18 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  plan:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      build: ${{ steps.plan.outputs.build }}
-      tag: ${{ steps.plan.outputs.tag }}
-      commit: ${{ steps.plan.outputs.commit }}
-      release_tag: ${{ steps.plan.outputs.release_tag }}
-      prerelease: ${{ steps.plan.outputs.prerelease }}
-      tailscale_version: ${{ steps.plan.outputs.tailscale_version }}
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          persist-credentials: false
-      - id: plan
-        name: Check upstream release and existing build
-        run: python3 scripts/plan.py
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REQUESTED_TAG: ${{ inputs.tag }}
-      - name: Verify patch selection
-        run: python3 -m unittest discover -s scripts -p test_tailscale_patch.py
-
-  build:
-    if: needs.plan.outputs.build == 'true'
-    needs: plan
-    runs-on: windows-latest
-    timeout-minutes: 50
-    defaults:
-      run:
-        shell: pwsh
-    env:
-      UPSTREAM_TAG: ${{ needs.plan.outputs.tag }}
-      UPSTREAM_COMMIT: ${{ needs.plan.outputs.commit }}
-      EXPECTED_TAILSCALE_VERSION: ${{ needs.plan.outputs.tailscale_version }}
-      GOWORK: 'off'
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          persist-credentials: false
-      - name: Fetch tagged sing-box and its pinned desktop source
-        id: source
-        run: |
-          $PSNativeCommandUseErrorActionPreference = $true
-          git init src/sing-box
-          git -C src/sing-box config core.autocrlf false
-          git -C src/sing-box remote add origin https://github.com/SagerNet/sing-box.git
-          git -C src/sing-box fetch --depth=1 origin "refs/tags/$env:UPSTREAM_TAG"
-          git -C src/sing-box checkout --detach FETCH_HEAD
-          if ((git -C src/sing-box rev-parse HEAD) -cne $env:UPSTREAM_COMMIT) {
-            throw "The upstream tag moved after planning."
-          }
-          git -C src/sing-box tag -f $env:UPSTREAM_TAG HEAD
-          git -C src/sing-box -c core.autocrlf=false submodule update --init --recursive --depth=1 -- clients/desktop
-          $version = Get-Content src/sing-box/clients/desktop/version.json -Raw | ConvertFrom-Json
-          if ($version.go_version -cnotmatch '^go[0-9]+\.[0-9]+\.[0-9]+$') {
-            throw 'Missing desktop Go toolchain version.'
-          }
-          "go=$($version.go_version.Substring(2))" >> $env:GITHUB_OUTPUT
-      - uses: actions/setup-go@v5
-        with:
-          go-version: ${{ steps.source.outputs.go }}
-          cache-dependency-path: src/sing-box/go.sum
-      - name: Apply pinned PR and prepare desktop version
-        run: python scripts/prepare.py
-      - name: Run Tailscale UDP recovery regression tests
-        working-directory: src/sing-box
-        run: |
-          $PSNativeCommandUseErrorActionPreference = $true
-          $report = Join-Path $env:GITHUB_WORKSPACE dist/magicsock-tests.jsonl
-          go test -mod=mod -json -count=1 -timeout=120s -run '^TestBindRetry' github.com/sagernet/tailscale/wgengine/magicsock |
-            Tee-Object -FilePath $report
-          $passed = @(Get-Content $report | ForEach-Object { ConvertFrom-Json $_ } |
-            Where-Object { $_.Action -eq 'pass' -and $_.Test -match '^TestBindRetry[^/]+$' } |
-            Select-Object -ExpandProperty Test -Unique)
-          $manifest = Get-Content ../../dist/build-info.json -Raw | ConvertFrom-Json
-          if ($passed.Count -lt $manifest.minimum_recovery_tests) {
-            throw "Expected at least $($manifest.minimum_recovery_tests) UDP recovery tests for $($manifest.patch_variant), got $($passed.Count)."
-          }
-        env:
-          GOTOOLCHAIN: local
-      - uses: pnpm/action-setup@v4
-        with:
-          package_json_file: src/sing-box/clients/desktop/package.json
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: src/sing-box/clients/desktop/package.json
-          cache: pnpm
-          cache-dependency-path: |
-            src/sing-box/clients/desktop/pnpm-lock.yaml
-            src/sing-box/clients/desktop/dashboard/pnpm-lock.yaml
-      - name: Install desktop dependencies
-        working-directory: src/sing-box/clients/desktop
-        run: |
-          $PSNativeCommandUseErrorActionPreference = $true
-          rustup toolchain install 1.88.0 --profile minimal --target x86_64-pc-windows-msvc
-          pnpm install --frozen-lockfile
-          pnpm -C dashboard install --frozen-lockfile
-      - name: Trust the pinned public certificate on this runner
-        timeout-minutes: 2
-        run: |
-          $PSNativeCommandUseErrorActionPreference = $true
-          $cert = (Resolve-Path SFW-Patched-Code-Signing.cer).Path
-          certutil.exe -f -addstore Root $cert
-      - name: Package and sign using the upstream desktop build
-        timeout-minutes: 30
-        working-directory: src/sing-box/clients/desktop
-        env:
-          WINDOWS_SIGNING_PFX: ${{ secrets.WINDOWS_SIGNING_PFX }}
-          WINDOWS_SIGNING_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PASSWORD }}
-          RUSTUP_TOOLCHAIN: '1.88.0'
-        run: |
-          $PSNativeCommandUseErrorActionPreference = $true
-          if (!$env:WINDOWS_SIGNING_PFX -or !$env:WINDOWS_SIGNING_PASSWORD) {
-            throw 'Configure the dedicated Windows signing secrets.'
-          }
-          $certificatePath = Join-Path $env:RUNNER_TEMP sfw-signing.pfx
-          $publicCertificate = Join-Path $env:GITHUB_WORKSPACE dist/SFW-Patched-Code-Signing.cer
-          $pinnedCertificate = Join-Path $env:GITHUB_WORKSPACE SFW-Patched-Code-Signing.cer
-          try {
-            [IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($env:WINDOWS_SIGNING_PFX))
-            $cert = [Security.Cryptography.X509Certificates.X509Certificate2]::new(
-              $certificatePath, $env:WINDOWS_SIGNING_PASSWORD,
-              [Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet)
-            [IO.File]::WriteAllBytes($publicCertificate, $cert.Export(
-              [Security.Cryptography.X509Certificates.X509ContentType]::Cert))
-            if ((Get-FileHash $publicCertificate).Hash -ne (Get-FileHash $pinnedCertificate).Hash) {
-              throw 'Signing secret does not match the pinned public certificate.'
-            }
-            @{
-              windows = @{
-                certificateFile = $certificatePath
-                certificatePassword = $env:WINDOWS_SIGNING_PASSWORD
-              }
-            } | ConvertTo-Json -Depth 3 | Set-Content -Encoding utf8NoBOM signing.local.json
-            Remove-Item Env:WINDOWS_SIGNING_PFX, Env:WINDOWS_SIGNING_PASSWORD
-            pnpm package:win -- x64
-          } finally {
-            Remove-Item -LiteralPath $certificatePath, signing.local.json -ErrorAction SilentlyContinue
-          }
-      - name: Verify installer signatures and daemon build metadata
-        run: ./scripts/verify.ps1
-        env:
-          GOTOOLCHAIN: local
-      - uses: actions/upload-artifact@v4
-        with:
-          name: sfw-windows-x64
-          path: dist/
-          if-no-files-found: error
-          retention-days: 14
-
-  release:
-    needs: [plan, build]
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+  windows:
+    name: SFW (${{ matrix.channel }})
     permissions:
       contents: write
-    env:
-      GH_TOKEN: ${{ github.token }}
-      UPSTREAM_TAG: ${{ needs.plan.outputs.tag }}
-      RELEASE_TAG: ${{ needs.plan.outputs.release_tag }}
-      PRERELEASE: ${{ needs.plan.outputs.prerelease }}
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: sfw-windows-x64
-          path: dist
-      - name: Publish verified installer
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd dist
-          sha256sum --check SHA256SUMS.txt
-          title="Unofficial SFW ${UPSTREAM_TAG#v} for Windows x64 — Tailscale UDP Bind Recovery"
-          cat > notes.md <<EOF
-          Unofficial build of [sing-box ${UPSTREAM_TAG}](https://github.com/SagerNet/sing-box/releases/tag/${UPSTREAM_TAG}) with the [Tailscale UDP bind recovery patch (SagerNet/tailscale#12)](https://github.com/SagerNet/tailscale/pull/12). It retries failed UDP binds so Tailscale can rediscover direct paths after the network returns.
-
-          The desktop sidebar displays +ts-udp-rebind after the version. If you already run the same sing-box version, rerun this installer manually to get the sidebar label. The app checks for newer sing-box versions in this repository.
-
-          The installer, GUI, and daemon use this repository's own signing certificate. Compare its thumbprint with the pinned value in the repository README before trusting the included public certificate. This version checks for updates from this Releases page.
-
-          See build-info.json for the exact source commits, Tailscale module checksum, and patch details. This release's tag points to the build scripts and patches. The repository README explains where to obtain the corresponding upstream source.
-          EOF
-          flags=()
-          if [[ "$PRERELEASE" == true ]]; then flags+=(--prerelease); fi
-          if state="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null)"; then
-            if [[ "$state" == false ]]; then exit 0; fi
-          else
-            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-              --title "$title" --notes-file notes.md --draft "${flags[@]}"
-          fi
-          gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber \
-            SFW-*-x64-pr12.exe SFW-Patched-Code-Signing.cer SHA256SUMS.txt build-info.json
-          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: ${{ fromJSON(inputs.tag && '["manual"]' || '["stable", "preview"]') }}
+    uses: ./.github/workflows/windows-release.yml
+    with:
+      tag: ${{ inputs.tag }}
+      channel: ${{ matrix.channel }}
+    secrets:
+      WINDOWS_SIGNING_PFX: ${{ secrets.WINDOWS_SIGNING_PFX }}
+      WINDOWS_SIGNING_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PASSWORD }}
